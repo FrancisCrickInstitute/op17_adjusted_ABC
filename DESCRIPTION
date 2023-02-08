@@ -1,0 +1,16 @@
+Package: op17
+Title: mSWI/SNF x ASCL1
+Version: 0.0.0
+Authors@R: c(
+    person("Stephanie", "Strohbuecker", , "stephanie.strohbuecker@crick.ac.uk", role = c("aut", "cre"),
+           comment = c(ORCID = "0000-0002-9781-6879")),
+    person("BABS", , , "bioinformatics@crick.ac.uk", role = c("aut", "cre"))
+  )
+Description: ABC algorithm step 1
+License: GLP-3
+Depends: 
+    R(>= 4.1.2)
+Encoding: UTF-8
+LazyData: TRUE
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.1.2

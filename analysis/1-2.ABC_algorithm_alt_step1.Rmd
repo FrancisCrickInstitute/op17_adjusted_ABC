@@ -1,0 +1,326 @@
+---
+title: "SWI/SNF and ASCL1"
+subtitle: "Activity by Contact (ABC) Model of enhancer-gene specificity"
+author: "Stephanie Strohbuecker"
+output:
+  html_document:
+    df_print: paged
+---
+The following descrives the usage of the [ABC algorithm](https://github.com/broadinstitute/ABC-Enhancer-Gene-Prediction) to identify enhancer-gene relationsships. 
+
+The ABC algorithm consists of three steps:
+
+1. Define candidate enhancer regions
+2. Quantify enhancer activity
+3. Compute ABC Scores
+
+Whilst running step 1 with the default settings within the ABC algorithm, we observed that no putative enhancer regions were detected on the majority of chromosomes. As this seems highly unlikely, we run the same steps required for step 1 outside the ABC algorithm.
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      eval.after = "fig.cap",
+                      fig.width = 12)
+```
+
+In the following we identify putative enhancer regions and their predicted targets in wildtype neurons.
+
+## Data pre-processing for the ABC algorithm
+
+The ABC algorithm needs for each cell type under investigation the following inputs:
+
+* open chromatin information
+    - ATAC-seq (PM19276, NRS_WT and PM21132, WT)
+* chromation modification for enhancers (H3K27ac)
+    - ChIP-seq (this project)
+* a measure of gene expresssion (optional)
+    - RNA-seq (RN19275, NRS_WT)
+    
+* gene annotation bed file
+* chromosome annotation bed file
+
+We are analysing the ChIP-seq data using the nextflow [ChIP-seq pipeline, version 1.2.2](https://nf-co.re/chipseq) available at [nf-core](https://nf-co.re/) using the `--broad` option for MACS to identify broad peaks for the histone modifications.
+The ATAC-seq data  and RNA-seq data was also analysed using the appropriate nextflow pipelines:
+
+* [RNA-seq pipeline, version 3.7](https://nf-co.re/rnaseq/3.7) using the option `--aligner star-rsem` for read alignment
+* [ATAC-seq pipeline, version 1.2.1]() using the `--narrow_peak` option for MACS (default FDR cut-off `-q 0.05`)
+
+The pipelines allow to obtain QC metrics, performs alignment and merging of multiple libraries, filtering and alignment QC. They also allow further analyses including, fore example, annotation of obtained peaks.
+
+We aligned against: `Homo_sapiens.GRCh37.75` as that was the genome used for the RNA-seq analysis.
+
+```{r}
+RMD_file_name <- "1-2.ABC_algorithm_alt_step1"
+```
+
+
+
+```{r message=FALSE, warning=FALSE}
+## Libraries
+library(tidyverse)
+library(here)
+
+library(ggpubr)
+
+library(plyranges)
+library(DiffBind)
+```
+
+```{r message=FALSE, warning=FALSE}
+# load_all() makes the functions in the R/ directory available for usage
+pkgload::load_all()
+```
+
+```{r}
+# Path to output and figures directories
+gtf_file <-
+  here("data",
+       "raw_data",
+       "genome_file_ABC",
+       "Homo_sapiens.GRCh37.75.gtf")
+
+base_dir <- here("data",
+                 "derived_data")
+
+ATAC_bam <- list.files(c(
+  here(
+    base_dir,
+    "nfcore_ATAC",
+    "results_PM19276",
+    "bwa",
+    "mergedLibrary"
+  ),
+  here(base_dir, "nfcore_ATAC", "results", "bwa", "mergedLibrary")
+),
+pattern = ".bam$",
+full.names = TRUE) %>%
+  set_names(str_remove(basename(.), ".mLb.clN.sorted.bam"))
+
+output_dirs <-
+  str_c(
+    here(),
+    "data/derived_data",
+    c("Tables", "R_objects", "Figures"),
+    RMD_file_name,
+    sep = "/"
+  ) %>%
+  set_names(c("Tables", "R_objects", "Figures"))
+
+walk(output_dirs, ~
+       generate_directories(.x))
+
+log_dir <- here("analysis", "logs")
+scripts_dir <- here("analysis", "scripts")
+```
+
+# Define candidate elements
+
+## MACS with ABC-specific parameters
+
+To define candidate elements we need to re-run [MACS](https://github.com/macs3-project/MACS/blob/master/docs/callpeak.md) with specific parameters required for the ABC algorithm: 
+
+* `-p 0.1`
+* `--call-summits TRUE`
+
+```{r}
+imap(ATAC_bam, function(ATAC_file, file_name) {
+  slurm_cmd <-
+    str_c(
+      "sbatch -c 8 --mem-per-cpu 8G -N 1 --time 24:00:00 --output",
+      str_c(log_dir,
+            str_c("1-1b.MACS2_for_ABC_", file_name, ".log", sep = ""),
+            sep = "/"),
+      "--error",
+      str_c(log_dir,
+            str_c("1-1b.MACS2_for_ABC_", file_name, ".log", sep = ""),
+            sep = "/"),
+      str_c(scripts_dir, "1-1b.MACS2_for_ABC.sh", sep = "/"),
+      ATAC_file,
+      file_name,
+      output_dirs[1],
+      sep = " "
+    )
+  
+  slurm_cmd
+})
+```
+
+# DiffBind alternative analaysis
+
+To replicate the steps taken by the ABC algorithm in the first step (`makeCandidateRegions.py`), we use the Bioconductor package [DiffBind](https://bioconductor.org/packages/release/bioc/html/DiffBind.html).
+
+The ABC step `makeCandidateRegions.py` consists of the following steps:
+
+1. Count the ATAC read that overlap the identified peak regions (macs2)
+2. Take top N regions, get summits, extend summits, merge, remove blocklist, add includelist, sort and merge
+
+Note that `makeCandidateRegions.py` only uses one bam and one peak file as input. The authors of the ABC algorithm suggest to use only one replicate or to merge the bam files ([github issue](https://github.com/broadinstitute/ABC-Enhancer-Gene-Prediction/issues/45)).
+
+```{r}
+peak_files <-
+  list.files(str_c(output_dirs[1], "Peaks", sep = "/"),
+             pattern = ".macs2_peaks.xls",
+             full.names = TRUE) %>%
+  set_names(str_remove(basename(.), ".macs2_peaks.xls"))
+```
+
+```{r}
+blacklist <- read_bed(
+  here(
+    "data",
+    "derived_data",
+    "Tables",
+    "1-1.ABC_algorithm_TSS_annotation",
+    "ENCFF001TDO_blocklisted_regions_GRCh37.ensembl.sort.bed"
+  )
+)
+```
+
+## Reading in peak sets
+
+```{r}
+# generate sample_sheet
+sample_info <- peak_files %>%
+  enframe(name = "SampleID", value = "Peaks") %>%
+  separate(
+    SampleID,
+    into = c("Tissue", "Replicate"),
+    sep = "_R",
+    remove = FALSE
+  ) %>%
+  mutate(Condition = "WT",
+         PeakCaller = "macs") %>%
+  left_join(ATAC_bam %>%
+              enframe(name = "SampleID", value = "bamReads"), by = "SampleID") %>% 
+  select(SampleID, Tissue, Condition, Replicate, bamReads, Peaks, PeakCaller)
+```
+
+```{r}
+wt <- dba(sampleSheet = sample_info)
+```
+
+
+```{r}
+# Apply blacklist
+wt <- dba.blacklist(wt, blacklist = blacklist, greylist = blacklist)
+```
+
+```{r}
+plot(wt)
+```
+
+```{r}
+olap.rate <- dba.overlap(wt, mode = DBA_OLAP_RATE)
+olap.rate
+```
+
+```{r}
+plot(olap.rate,
+     type = 'b',
+     ylab = '# peaks',
+     xlab = 'Overlap at least this many peaksets')
+```
+
+```{r}
+dba.peakset(wt, bRetrieve = TRUE) %>% 
+  as_tibble() %>%
+  ggplot(aes(width)) + 
+  geom_density() +
+  geom_vline(xintercept = (250))
+```
+
+
+
+## Counting reads
+
+Calculate a binding matrix with scores based on read counts for every sample (affinity scores), rather than condifence scores for only those peaks called in a specific sample (occupancy scores).
+
+Calculate count information for each of the peaks/regions in the consensus set. For each of the consensus regions `DiffBind` takes the number of uniquely aligned reads to compute a normalised read count for each sample at every potential binding site. The peaks in the consensus peakse are re-centred and trimmed based on calculating their summits (point of greatest read overlap) in order to provide more standardized peak intervals.
+
+```{r}
+wt <- dba.count(wt, summits = 275, minOverlap = 2)
+```
+
+```{r}
+dba.peakset(wt, bRetrieve = TRUE) %>% 
+  as_tibble() %>%
+  ggplot(aes(width)) + 
+  geom_density() +
+  geom_vline(xintercept = (550)) +
+  coord_cartesian(xlim = c(0, 1000))
+```
+
+By default the data are normalized based on sequencing depth. Note that background normalization is recommended for ATAC-seq analysis in the [DiffBind vignette](https://bioconductor.org/packages/release/bioc/vignettes/DiffBind/inst/doc/DiffBind.pdf).
+
+From the vignette:
+
+> The core background normalization technique is to divide the genome into large bins and
+> count overlapping reads7. As the enrichment expected in ChIP-seq (and ATAC-seq) is ex-
+> pected to occur over relatively narrow intervals (roughly between 100bp and 600bp), it is
+> expected that there should not be systematic differences in signals over much larger intervals
+> (on the order of 10,000bp and greater). Any differences seen should be technical rather than
+> biological, so it is safer to normalize based these differences.
+
+```{r}
+cand_peakset <- dba.peakset(wt, bRetrieve = TRUE) %>% 
+  as_tibble() %>% 
+  mutate(sum_norm_score = rowMeans(select(., contains("WT"))), 
+         start = if_else(start < 0, 0L, start)) %>% 
+  arrange(desc(sum_norm_score)) %>% 
+  top_n(150000, wt = sum_norm_score) %>% 
+  select(seqnames, start, end) 
+
+cand_peakset  %>% 
+  write_tsv(str_c(
+    output_dirs[["Tables"]],
+    "consensus_DiffBind_macs_narrowPeak_candidateRegions.bed",
+    sep = "/"
+  ),
+  col_names = FALSE)
+```
+
+Run the following via the command line using BEDTools
+```{bash eval=FALSE, include=FALSE}
+module purge
+module load BEDTools/2.29.2-GCC-9.3.0
+```
+
+```{r}
+genome_sizes <-
+  here(
+    "data",
+    "derived_data",
+    "Tables",
+    "1-1.ABC_algorithm_TSS_annotation",
+    "Homo_sapiens.GRCh37.75.chr_sizes"
+  )
+```
+
+
+```{r}
+str_c(
+  "bedtools sort -i",
+  str_c(
+    output_dirs[["Tables"]],
+    "consensus_DiffBind_macs_narrowPeak_candidateRegions.bed",
+    sep = "/"
+  ),
+  "-faidx",
+  genome_sizes,
+  "|",
+  "bedtools merge -i stdin |",
+  "cut -f 1-3 |",
+  "(bedtools intersect -a data/derived_data/Tables/1-1.ABC_algorithm_TSS_annotation/Homo_sapiens.GRCh37.75.TSS_500bp.sort.bed -b",
+  str_c(genome_sizes, "bed", sep = "."),
+  "-wa | cut -f 1-3 && cat) | bedtools sort -i stdin -faidx",
+  genome_sizes  ,
+  "| bedtools merge -i stdin >",
+  
+  str_c(
+    output_dirs[["Tables"]],
+    "consensus_DiffBind_macs_narrowPeak_candidateRegions_sorted.bed",
+    sep = "/"
+  )
+  ,
+  sep = " "
+)
+```

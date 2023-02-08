@@ -1,0 +1,16 @@
+# Install ABC algorithm
+
+module purge
+module load git/2.32.0-GCCcore-10.3.0-nodocs
+
+git clone https://github.com/broadinstitute/ABC-Enhancer-Gene-Prediction.git
+
+cd ABC-Enhancer-Gene-Prediction
+
+conda env create -f abcenv.yml
+conda activate final-abc-env
+
+# install MACS2 to re-run peak calling with specific parameters from bam files
+
+conda env create -f macs.yml
+conda activate abc-macs-py2.7

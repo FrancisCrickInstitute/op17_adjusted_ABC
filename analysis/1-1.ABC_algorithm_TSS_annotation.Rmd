@@ -1,0 +1,503 @@
+---
+title: "SWI/SNF and ASCL1"
+subtitle: "Activity by Contact (ABC) Model of enhancer-gene specificity - identify TSS"
+author: "Stephanie Strohbuecker"
+output:
+  html_document:
+    df_print: paged
+---
+
+The following describes the usage of the [ABC algorithm](https://github.com/broadinstitute/ABC-Enhancer-Gene-Prediction) to identify enhancer-gene relationships. This scripts generates the TSS annotation based on the expression detected in the RNA-seq (RN19275) and the information provided in the supplementary data of the [paper](https://pubmed.ncbi.nlm.nih.gov/31784727/).
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      eval.after = "fig.cap",
+                      fig.width = 12)
+```
+
+
+We aligned against: `Homo_sapiens.GRCh37.75` as that was the genome used for the RNA-seq analysis.
+
+```{r}
+RMD_file_name <- "1-1.ABC_algorithm_TSS_annotation"
+```
+
+
+
+```{r message=FALSE, warning=FALSE}
+## Libraries
+library(tidyverse)
+library(here)
+
+library(ggpubr)
+
+library(plyranges)
+```
+
+```{r message=FALSE, warning=FALSE}
+# load_all() makes the functions in the R/ directory available for usage
+pkgload::load_all()
+```
+
+```{r}
+# Path to output and figures directories
+gtf_file <-
+  here("data",
+       "raw_data",
+       "genome_file_ABC",
+       "Homo_sapiens.GRCh37.75.gtf")
+
+base_dir <- here("data",
+      "derived_data")
+
+RNA_seq_quant <-
+  read_tsv(
+    here("data", "derived_data", "nfcore_RNA", "star_rsem", "rsem.merged.transcript_tpm.tsv")
+  )
+
+output_dirs <-
+  str_c(here(),
+        "data/derived_data",
+        c("Tables", "R_objects", "Figures"),
+        RMD_file_name,
+        sep = "/") %>%
+  set_names(c("Tables", "R_objects", "Figures"))
+
+walk(output_dirs, ~
+      generate_directories(.x))
+```
+
+#### Adjust the gene and TSS annotation
+
+We adjusted the gene annotation file based on the information available in the supplementary information of the [paper](https://doi.org/10.1038/s41588-019-0538-0).
+
+* Select one TSS for each gene 
+    - the TSS used by the largest number of coding isoforms
+    - we selected the TSS that was used by the most highly expressed isoform in the RNA-seq (RN19275)
+* remove genes corresponding to small RNAs 
+    - gene symbol contains "MIR" or "RNU"
+    - gene body length < 300bp
+* remove very long RNAs
+    - gene body > 2Mb
+
+```{r}
+gtf <- read_gff(gtf_file)
+```
+
+According to the paper we removed small RNAs (gene name contains ‘MIR’ or ‘RNU’, or gene body length < 300 bp), as well as very long RNA (gene body > 2Mb). Note we calculated gene body length by summing across the exon widths of each transcript.
+
+```{r}
+gtf <- gtf %>%
+  filter(!str_detect(gene_name, "MIR|RNU"))
+```
+
+```{r}
+excl_by_length <- gtf %>%
+  as_tibble() %>%
+  filter(type == "exon") %>%
+  group_by(transcript_id) %>%
+  summarise(gene_body_width = sum(width)) %>%
+  filter(gene_body_width < 300 | gene_body_width > 2000000) %>%
+  pull(transcript_id)
+```
+
+```{r}
+gtf <- gtf %>%
+  filter(!(transcript_id %in% excl_by_length))
+```
+
+We obtained the merged transcript TPMs from the run of the nf-core RNA-seq pipeline with RSEM-STAR. We subsequently identified the transcript isoform for each gene which showed the highest mean TPM expression across the three replicates.
+```{r}
+RNA_seq_quant_filt <-
+  RNA_seq_quant %>%
+  filter(gene_id %in% gtf$gene_id) %>%
+  mutate(mean_TPM = rowMeans(select(., starts_with("PAU")))) %>%
+  group_by(gene_id) %>%
+  filter(mean_TPM == max(mean_TPM))
+```
+
+```{r}
+RNA_seq_quant_filt_no_dup <- RNA_seq_quant_filt %>%
+  filter(!duplicated(gene_id) &
+           !duplicated(gene_id, fromLast = TRUE)) 
+```
+
+```{r}
+RNA_quant_gr <- gtf %>% 
+  filter(transcript_id %in% RNA_seq_quant_filt_no_dup$transcript_id)
+```
+
+```{r}
+tss_anno <- RNA_quant_gr %>% 
+  filter(!(transcript_id %in% excl_by_length)) %>% 
+  filter(!str_detect(gene_name, "MIR|RNU")) %>% 
+  filter(type =="transcript")%>% 
+  anchor_5p() %>% 
+  mutate(width = 1) %>% 
+  anchor_centre() %>% 
+  mutate(width = 500)
+```
+
+```{r}
+tss_anno <- tss_anno %>% 
+  select(gene_id, score) %>% 
+  mutate(score = 0) %>% 
+  as_tibble() %>% 
+  select(-width) %>% 
+  relocate(strand, .after = score)
+```
+
+
+For some genes several isoforms show equal expression levels (in most cases 0TPM, but not in all). In these cases we select the TSS that is used by the majority of isoforms.
+```{r}
+duplicated_gene_id <- RNA_seq_quant_filt %>% 
+  filter(duplicated(gene_id) | duplicated(gene_id, fromLast = TRUE)) %>% 
+  distinct(gene_id)
+```
+
+```{r}
+duplicated_most_used_TSS <-
+  gtf %>%
+  filter(gene_id %in% duplicated_gene_id$gene_id) %>%
+  filter(type == "transcript") %>%
+  as_tibble() %>%
+  left_join(RNA_seq_quant, by = c("gene_id", "transcript_id")) %>%
+  mutate(mean_TPM = rowMeans(select(., starts_with("PAU")))) %>%
+  as_granges() %>%
+  select(type,
+         gene_id,
+         gene_name,
+         gene_biotype,
+         transcript_id,
+         starts_with("PAU"),
+         mean_TPM) %>%
+  anchor_5p() %>%
+  mutate(width = 1) %>%
+  as_tibble() %>%
+  group_by(gene_id) %>%
+  filter(mean_TPM == max(mean_TPM)) %>%
+  group_by(gene_id, start) %>%
+  mutate(count_nb_tss = n()) %>%
+  group_by(gene_id) %>%
+  filter(count_nb_tss == max(count_nb_tss)) %>%
+  ungroup() %>%
+  select(
+    seqnames,
+    start,
+    end,
+    strand,
+    gene_id,
+    gene_biotype,
+    # starts_with("PAU"),
+    mean_TPM,
+    count_nb_tss
+  ) %>%
+  distinct()
+```
+
+```{r}
+# For the genes with several transcript start sites we keep the one most used across isoforms
+tss_anno <-
+  duplicated_most_used_TSS %>%
+  filter(!duplicated(gene_id) &
+           !duplicated(gene_id, fromLast = TRUE)) %>%
+  as_granges() %>%
+  anchor_centre() %>%
+  mutate(width = 500,
+         score = 0) %>%
+  as_tibble() %>%
+  select(seqnames, start, end, gene_id, score, strand) %>%
+  bind_rows(tss_anno)
+```
+
+
+```{r}
+# check for isoforms that overlap each other in a 500bp window, use the centre of that combined genomic range as the centre for the 500bp TSS window
+tss_anno <- duplicated_most_used_TSS %>% 
+  filter(duplicated(gene_id) | duplicated(gene_id, fromLast = TRUE)) %>%
+  as_granges() %>% 
+  anchor_centre() %>% 
+  mutate(width = 500) %>% 
+  group_by(gene_id) %>% 
+  reduce_ranges_directed() %>% 
+  anchor_centre() %>% 
+  mutate(width = 500,
+         score = 0) %>% 
+  as_tibble() %>% 
+  filter(!duplicated(gene_id) & !duplicated(gene_id, fromLast = TRUE)) %>%
+  select(seqnames, start, end, gene_id, score, strand) %>%
+  bind_rows(tss_anno)
+```
+
+```{r}
+dupl_TSS <- duplicated_most_used_TSS %>% 
+  filter(!(gene_id %in% tss_anno$gene_id))
+```
+
+```{r}
+# From the remaining genes we select the TSS for the protein-coding transcript
+tss_anno <- gtf %>%
+  filter(gene_id %in% duplicated_gene_id$gene_id) %>%
+  filter(type == "transcript") %>%
+  as_tibble() %>%
+  left_join(RNA_seq_quant, by = c("gene_id", "transcript_id")) %>% 
+  as_granges() %>%
+  anchor_5p() %>%
+  mutate(width = 1) %>% 
+  as_tibble() %>% 
+  right_join(dupl_TSS, by = c("seqnames", "start", "end", "strand", "gene_id", "gene_biotype")) %>% 
+  filter(source == "protein_coding") %>% 
+  filter(!duplicated(gene_id) & !duplicated(gene_id, fromLast = TRUE)) %>% 
+  as_granges() %>%
+  anchor_centre() %>%
+  mutate(width = 500,
+         score = 0) %>%
+  as_tibble() %>%
+  select(seqnames, start, end, gene_id, score, strand) %>%
+  bind_rows(tss_anno)
+```
+
+```{r}
+dupl_TSS <- duplicated_most_used_TSS %>% 
+  filter(!(gene_id %in% tss_anno$gene_id))
+```
+
+```{r}
+# Next we select the TSS for the isoform which shows maximum expression in one of the replicates
+tss_anno <- gtf %>%
+  filter(gene_id %in% duplicated_gene_id$gene_id) %>%
+  filter(type == "transcript") %>%
+  as_tibble() %>%
+  left_join(RNA_seq_quant, by = c("gene_id", "transcript_id")) %>% 
+  as_granges() %>%
+  anchor_5p() %>%
+  mutate(width = 1) %>% 
+  as_tibble() %>% 
+  right_join(dupl_TSS, by = c("seqnames", "start", "end", "strand", "gene_id", "gene_biotype")) %>% 
+  mutate(max_TPM = pmax(PAU616A10, PAU616A11, PAU616A12)) %>% 
+  group_by(gene_id) %>% 
+  filter(max_TPM == max(max_TPM)) %>% 
+  filter(!duplicated(gene_id) & !duplicated(gene_id, fromLast = TRUE)) %>% 
+  as_granges() %>%
+  anchor_centre() %>%
+  mutate(width = 500,
+         score = 0) %>%
+  as_tibble() %>%
+  select(seqnames, start, end, gene_id, score, strand) %>%
+  bind_rows(tss_anno)
+```
+
+```{r}
+dupl_TSS <- duplicated_most_used_TSS %>% 
+  filter(!(gene_id %in% tss_anno$gene_id))
+```
+
+```{r}
+# For the remaining genes we select the most 5' TSS as the TSS for the gene
+tss_anno <- gtf %>%
+  filter(gene_id %in% duplicated_gene_id$gene_id) %>%
+  filter(type == "transcript") %>%
+  as_tibble() %>%
+  left_join(RNA_seq_quant, by = c("gene_id", "transcript_id")) %>% 
+  as_granges() %>%
+  anchor_5p() %>%
+  mutate(width = 1,
+         score = 0) %>% 
+  as_tibble() %>% 
+  right_join(dupl_TSS, by = c("seqnames", "start", "end", "strand", "gene_id", "gene_biotype")) %>%
+  group_by(gene_id) %>% 
+  filter(strand == "+" & start == min(start) | strand == "-" & start == max(start))%>%
+  as_tibble() %>%
+  select(seqnames, start, end, gene_id, score, strand) %>% 
+  distinct() %>% 
+  filter(!duplicated(gene_id) & !duplicated(gene_id, fromLast = TRUE)) %>% 
+  as_granges() %>%
+  anchor_centre() %>%
+  mutate(width = 500,
+         score = 0) %>%
+  as_tibble() %>%
+  select(-width) %>% 
+  bind_rows(tss_anno)
+```
+
+```{r}
+tss_anno <- tss_anno %>% 
+  relocate(strand, .after = score)
+```
+
+```{r}
+# write_tsv(
+#   tss_anno,
+#   str_c(
+#     output_dirs[["Tables"]],
+#     "Homo_sapiens.GRCh37.75.TSS_500bp.bed",
+#     sep = "/"
+#   ),
+#   col_names = FALSE
+# )
+```
+
+```{bash, eval=False}
+# Sort genome bed to comply with expected input
+module purge
+module load BEDTools/2.29.2-GCC-9.3.0
+
+bedtools sort -i  Homo_sapiens.GRCh37.75.TSS_500bp.bed > Homo_sapiens.GRCh37.75.TSS_500bp.sort.bed
+```
+
+```{r}
+gene_bounds <- gtf %>%
+  filter(gene_id %in% tss_anno$gene_id) %>%
+  group_by(gene_id) %>%
+  reduce_ranges_directed() %>% 
+  as_tibble() %>% 
+  mutate(score = 0) %>% 
+  relocate(strand, .after = score) %>% 
+  select(-width)
+```
+
+```{r}
+write_tsv(
+  gene_bounds,
+  str_c(
+    output_dirs[["Tables"]],
+    "Homo_sapiens.GRCh37.75.CollapsedGeneBounds.bed",
+    sep = "/"
+  ),
+  col_names = FALSE
+)
+```
+
+```{bash, eval=False}
+# Sort genome bed to comply with expected input
+module purge
+module load BEDTools/2.29.2-GCC-9.3.0
+
+bedtools sort -i Homo_sapiens.GRCh37.75.CollapsedGeneBounds.bed > Homo_sapiens.GRCh37.75.CollapsedGeneBounds.sort.bed
+```
+
+```{r}
+# gene_id to symbol conversion
+gtf %>%
+  filter(gene_id %in% gene_bounds$gene_id) %>%
+  as_tibble() %>%
+  select(gene_id, gene_name, gene_biotype) %>%
+  distinct() %>%
+  write_tsv(str_c(
+    output_dirs[["Tables"]],
+    "Homo_sapiens.GRCh37.75.gene_to_symbol.tsv",
+    sep = "/"
+  ))
+```
+
+
+# Prepare additional genome files required for the ABC algorithm
+
+The ABC algorithm requires information about the chromosome sizes. We can extract those from the indexed fasta file (`.fa.fai`)
+
+```{r}
+read_tsv(
+  here(
+    "data",
+    "raw_data",
+    "genome_file_ABC",
+    "Homo_sapiens.GRCh37.75.dna_sm.primary_assembly.fa.fai"
+  ),
+  col_names = FALSE
+) %>% 
+  select(chrom_name = X1, chrom_size = X2) %>% 
+  # filter(chrom_name %in% unique(gene_bounds$seqnames)) %>% 
+  # arrange(as.numeric(chrom_name)) %>% 
+  mutate(chr_start = 0) %>% 
+  relocate(chr_start, .after = chrom_name) %>% 
+  write_tsv(  str_c(
+    output_dirs[["Tables"]],
+    "Homo_sapiens.GRCh37.75.chr_sizes.bed",
+    sep = "/"
+  ),
+  col_names = FALSE)
+```
+
+```{bash, eval=False}
+# Sort genome bed to comply with expected input
+module purge
+module load BEDTools/2.29.2-GCC-9.3.0
+
+bedtools sort -i Homo_sapiens.GRCh37.75.chr_sizes.bed > Homo_sapiens.GRCh37.75.chr_sizes.sort.bed
+
+# the name change is neccessary due to the naming assumptions in the ABC algorithm
+Homo_sapiens.GRCh37.75.chr_sizes.sort.bed > Homo_sapiens.GRCh37.75.chr_sizes.bed
+```
+
+```{r}
+read_tsv(
+  str_c(
+    output_dirs[["Tables"]],
+    "Homo_sapiens.GRCh37.75.chr_sizes.sort.bed",
+    sep = "/"
+  ),
+  col_names = FALSE
+) %>%
+  select(chrom_name = X1, chrom_size = X3) %>%
+  write_tsv(str_c(output_dirs[["Tables"]],
+                  "Homo_sapiens.GRCh37.75.chr_sizes",
+                  sep = "/"),
+            col_names = FALSE)
+```
+
+Ensure that the regions blocklist is in the ensembl format.
+```{r}
+read_tsv(
+  here(
+    "data",
+    "raw_data",
+    "genome_file_ABC",
+    "ENCFF001TDO_blocklisted_regions_GRCh37.bed"
+  ),
+  col_names = FALSE
+) %>% 
+  mutate(X1 = str_remove(X1, "chr")) %>% 
+  write_tsv(  str_c(
+    output_dirs[["Tables"]],
+    "ENCFF001TDO_blocklisted_regions_GRCh37.ensembl.bed",
+    sep = "/"
+  ),
+  col_names = FALSE)
+```
+
+```{bash, eval=False}
+# Sort genome bed to comply with expected input
+module purge
+module load BEDTools/2.29.2-GCC-9.3.0
+
+bedtools sort -i ENCFF001TDO_blocklisted_regions_GRCh37.ensembl.bed > ENCFF001TDO_blocklisted_regions_GRCh37.ensembl.sort.bed
+```
+
+Finally we convert the list of ubiquitously expressed genes (symbol) into their respective ensembl IDs.
+```{r}
+ubi_genes <- read_tsv(
+  here(
+    "data",
+    "raw_data",
+    "genome_file_ABC",
+    "UbiquitouslyExpressedGenesHG19_BioMartExport.txt"
+  ),
+  col_names = TRUE,
+  name_repair = "universal"
+) 
+```
+
+```{r}
+gene_bounds %>% 
+  filter(gene_id %in% ubi_genes$Ensembl.Gene.ID) %>% 
+  select(gene_id) %>% 
+    write_tsv(  str_c(
+    output_dirs[["Tables"]],
+    "UbiquitouslyExpressedGenesHG19_BioMartExport_EnsemblID.txt",
+    sep = "/"
+  ),
+  col_names = FALSE)
+```
+
+
+

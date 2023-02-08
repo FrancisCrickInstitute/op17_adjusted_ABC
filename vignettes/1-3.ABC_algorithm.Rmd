@@ -1,0 +1,598 @@
+---
+title: "SWI/SNF and ASCL1"
+subtitle: "Activity by Contact (ABC) Model of enhancer-gene specificity"
+author: "Stephanie Strohbuecker"
+output:
+  html_document:
+    df_print: paged
+---
+
+The following describes the usage of the [ABC algorithm](https://github.com/broadinstitute/ABC-Enhancer-Gene-Prediction) to identify enhancer-gene relationships. 
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      eval.after = "fig.cap",
+                      fig.width = 12)
+```
+
+
+In the following we identify putative enhancer regions and their predicted targets in wildtype neurons using the [Activity-by-Contact (ABC) model](https://doi.org/10.1038/s41588-019-0538-0).
+The ABC model constructs genome-wide maps of enhancer-gene connections in a given cell type. It thereby focuses on distal element-gene pairs (DE-G) where the distal elements (DEs) are located > 500bp from a TSS.
+
+The ABC model is based on the biochemical notion that an element's quantitative effect on a gene should depend on its strength (Activity) weighted by how often it comes into contact with the promoter of a gene (Contact). The relative contribution of an element on a gene's expression thereby depends on that element's effect divided by the total effect of all elements within 5 Mb. Activity within the model is estimated as the geometric mean of the read counts in ATAC-seq and H3K27ac ChIP-seq at the element. In the original model contact was estimated via Hi-C frequency, but in the absence of Hi-C data, chromatin is modeled as a featureless, uniform polymer.
+The resulting ABC score is thresholded to get a binary classifier of enhance-gene regulation.
+Candidate element-gene pairs that exceed the chosen threshold were defined as "enhancer-gene connections" and elements predicted to regulate at least one gene were defined as "ABC enhancers".
+
+Note that the ABC model does no perform well for ubiquitously expressed genes and distal promoter-gene regulatory relationships (i.e. distance < 500bp from a TSS). Furthermore exceptions to the ABC model are expected to occur, for example, CTCF binding distally may regulate gene expression by affecting 3D contacts.
+
+
+## Data pre-processing for the ABC algorithm
+
+For each cell type under investigation, the ABC algorithm requires the following inputs:
+
+* open chromatin information
+    - ATAC-seq (PM19276, NRS_WT and PM21132, WT)
+* chromation modification for enhancers (H3K27ac)
+    - ChIP-seq (this project)
+* optional: a measure of gene expresssion
+    - RNA-seq (RN19275, NRS_WT)
+    
+* gene annotation bed file
+* chromosome annotation bed file
+
+We are analysing the ChIP-seq data using the nextflow [ChIP-seq pipeline, version 1.2.2](https://nf-co.re/chipseq) available at [nf-core](https://nf-co.re/) using the `--broad` option for MACS to identify broad peaks for the histone modifications.
+The ATAC-seq data  and RNA-seq data were also analysed using the appropriate nextflow pipelines:
+
+* [RNA-seq pipeline, version 3.7](https://nf-co.re/rnaseq/3.7) using the option `--aligner star-rsem` for read alignment
+* [ATAC-seq pipeline, version 1.2.1](https://nf-co.re/atacseq/1.2.1) using the `--narrow_peak` option for MACS (default FDR cut-off `-q 0.05`)
+
+The pipelines allow to obtain QC metrics, perform alignment and merging of multiple libraries, filtering and alignment QC. They also allow further analyses including, for example, annotation of obtained peaks.
+
+We aligned against: `Homo_sapiens.GRCh37.75` as that was the genome used for the RNA-seq analysis.
+
+```{r}
+RMD_file_name <- "1-3.ABC_algorithm"
+```
+
+
+
+```{r message=FALSE, warning=FALSE}
+## Libraries
+library(tidyverse)
+library(here)
+
+library(ggpubr)
+
+library(plyranges)
+```
+
+```{r message=FALSE, warning=FALSE}
+# load_all() makes the functions in the R/ directory available for usage
+pkgload::load_all()
+```
+
+```{r}
+# Path to output and figures directories
+base_dir <- here("data",
+                 "derived_data")
+
+ATAC_bam <- list.files(c(
+  here(
+    base_dir,
+    "nfcore_ATAC",
+    "results_PM19276",
+    "bwa",
+    "mergedLibrary"
+  ),
+  here(base_dir, "nfcore_ATAC", "results", "bwa", "mergedLibrary")
+),
+pattern = ".bam$",
+full.names = TRUE) %>%
+  set_names(str_remove(basename(.), ".mLb.clN.sorted.bam"))
+
+H3K27ac_bam_files <-
+  list.files(
+    here(
+      "data",
+      "derived_data",
+      "nfcore_ChIP",
+      "results",
+      "bwa",
+      "mergedLibrary"
+    ),
+    pattern = "WT_H3K27ac_R.*\\.bam$",
+    full.names = TRUE
+  ) %>%
+  set_names(str_remove(basename(.), ".mLb.clN.sorted.bam"))
+
+gene_to_symbol <-
+  read_tsv(
+    here(
+      "data",
+      "derived_data",
+      "Tables",
+      "1-1.ABC_algorithm_TSS_annotation",
+      "Homo_sapiens.GRCh37.75.gene_to_symbol.tsv"
+    )
+  )
+
+output_dirs <-
+  str_c(
+    here(),
+    "data/derived_data",
+    c("Tables", "R_objects", "Figures"),
+    RMD_file_name,
+    sep = "/"
+  ) %>%
+  set_names(c("Tables", "R_objects", "Figures"))
+
+walk(output_dirs, ~
+       generate_directories(.x))
+
+log_dir <- here("analysis", "logs")
+scripts_dir <- here("analysis", "scripts")
+```
+
+```{r include=FALSE}
+# Prepare the expression estimation files for step 2 of the ABC algorithm
+read_tsv(
+  here(
+    "data",
+    "derived_data",
+    "nfcore_RNA",
+    "star_rsem",
+    "rsem.merged.gene_tpm.tsv"
+  )
+) %>%
+  select(gene_id, starts_with("PAU")) %>%
+  pivot_longer(cols = -gene_id,
+               names_to = "sample",
+               values_to = "TPM") %>%
+  group_by(sample) %>%
+  group_split() %>%
+  set_names(., map(., ~ unique(.x$sample))) %>%
+  imap( ~ .x %>%
+          select(-sample) %>%
+          write_tsv(str_c(
+            output_dirs[["R_objects"]],
+            str_c(.y, "TPM_genes.txt", sep = "_"),
+            sep = "/"
+          ),
+          col_names = FALSE))
+
+RNA_expr_files <-
+  list.files(output_dirs[["R_objects"]], pattern = "TPM_genes.txt", full.names = TRUE) %>%
+  set_names(str_remove(basename(.), "_TPM_genes.txt"))
+```
+
+
+# Introduction to the ABC model
+
+The ABC model is designed to represent a mechanistic model in which enhancers activate gene transcription upon enhancer-promoter contact. Thereby the quantitative effect of an enhancer depends on the frequency with which it contacts a promoter multiplied by the strength of the enhancer. Furthermore, the contribution of an enhancer to a gene's expression should also dependent on the surrounding enhancer context, i.e. the presence of other enhancers.
+
+**The ABC score:**
+
+ABC score for effect of element E on gene G = Activity of E × Contact frequency between E and G / 
+                                Sum of (Activity × Contact Frequency) over all candidate elements within 5 Mb.
+
+* Activity (A): geometric mean of the read counts of DNase-seq (ATAC-seq) and H3K27ac ChIP-seq at an element (E)
+* Contact (C): KR normalised Hi-C contact frequency between E and the promoter of gene F
+
+Elements are defined as ~500bp regions centered on DHS (ATAC) peaks.
+
+The ABC model only considers candidate elements and genes on the same chromosome and calculates ABC scores for each gene and chromatin accessible element within a 5Mb range. 
+
+
+#### ABC model assumptions: 
+
+* The effect of an element on gene expression is linearly proportional to contact frequency and enhancer Activity
+* A given enhancer has equal Activity for all genes – that is, it does not model the potential for biochemical specificity that could allow certain enhancers to regulate only certain promoters
+* Different enhancers contribute additively and independently to the expression of a gene 
+* The sum in the denominator includes the gene's own promoter, which is considered a potential enhancer calculated in the same manner as other enhancers 
+* The model computes the relative effect of an enhancer on gene expression, but does not estimate the absolute effect 
+* The model aims to predict the functions of enhancers, but not the functions of elements that act through other mechanisms 
+
+# Running the ABC model
+
+The predicted enhancer-gene connection are obtained in three steps:
+
+1. Define candidate enhancer regions
+2. Quantify enhancer activity
+3. Compute ABC Scores
+
+## Prepare the required annotation input files
+
+To run the ABC model, the following annotation files are required:
+
+* transcription start site bed file
+* gene annotation bed file
+* chromosome annotation bed file
+    - Information about chromosome sizes are available in the `fa.fai` file
+
+```{r eval=FALSE, include=FALSE}
+# For a more detailed description please refer to script `1-1.ABC_algorithm_TSS_annotation.Rmd`
+```
+
+We adjusted the gene annotation file based on the information available in the supplementary information of the [paper](https://doi.org/10.1038/s41588-019-0538-0):
+
+* Select one TSS for each gene 
+    - we selected the TSS that was used by the most highly expressed isoform (highest mean TPM expression across the three replicates) in the RNA-seq (RN19275)
+        - In cases where several isoforms show equal expression levels, we select the TSS that is used by the majority of isoforms
+        - For the remaining genes, i.e. those for which neither gene expression nor the majority vote identified a unique TSS, we selected the most 5' TSS 
+* remove genes corresponding to small RNAs 
+    - gene symbol contains "MIR" or "RNU"
+    - gene body length < 300bp (we calculated gene body length by summing across the exon widths of each transcript)
+* remove very long RNAs
+    - gene body > 2Mb
+    
+To generate the TSS file, we selected 500bp surrounding the TSS for each gene. For the gene annotation file we collapsed each gene to its most expanded ranges.
+
+## Define candidate elements
+
+As we encountered some issues with this step when running the native ABC model step (`makeCandidateRegions.py`), we replicated the default approach in R.
+
+```{r eval=FALSE, include=FALSE}
+# For a detailed description please refer to scrip `3-3.ABC_algorithm_alt_step1.Rmd`
+# Note thte issues encountered: we only obtained enhancer regions for chr9, X, Y and MT. Even though the ATAC-seq was known to be noisy, there is no reason to assume that the data obtained is noisier on certain chromosomes but not on others
+```
+
+This included the following steps:
+
+#### MACS with ABC-specific parameters
+
+`makeCandidateRegions.py` selects the strongest peaks as measured by absolute read counts (not by p-value). Using a lenient significance threshold in MACS (e.g. -`p 0.1`) peaks are called and the peaks with the most read counts are considered. The procedure implicitly assumes that the active karyotype of the cell type is constant.
+
+Re-run [MACS](https://github.com/macs3-project/MACS/blob/master/docs/callpeak.md) with specific parameters required for the ABC algorithm: 
+
+* `-p 0.1`
+* `--call-summits TRUE`
+
+
+#### DiffBind as an alternative to `makeCandidateRegions.py`
+
+To replicate the steps taken by the ABC algorithm in the first step (`makeCandidateRegions.py`), we use the Bioconductor package [DiffBind](https://bioconductor.org/packages/release/bioc/html/DiffBind.html).
+
+The ABC step `makeCandidateRegions.py` consists of the following steps:
+
+1. Count the ATAC read that overlap the identified peak regions (macs2)
+2. Take top N regions, get summits, extend summits, merge, remove blocklist, add includelist, sort and merge
+
+The authors of the ABC algorithm suggest to use only one replicate or to merge the bam files ([github issue](https://github.com/broadinstitute/ABC-Enhancer-Gene-Prediction/issues/45)) in the case of the availabilty of replicates. We analysed each replicate individually with MACS and removed elements overlapping regions of the genome that have been observed to accumulate anomalous number of reads in epigenetic sequencing ("block-listed regions" made available [here](https://sites.google.com/site/anshulkundaje/projects/blacklists)).
+The block-listed regions are available via the ENCODE project [for human, mouse and worm](https://sites.google.com/site/anshulkundaje/projects/blacklists) and, specifically [for GRCh37](https://www.encodeproject.org/files/ENCFF001TDO/).
+
+When computing the ABC score, the product of ATAC-seq (DNase-seq) and H3K27ac ChIP-seeq reads will be counted in each candidate elements. It is therefore neccessary that candidates regions of open (nucleosome depleted) chromatin are of sufficient length to capture H3K27ac marks on flanking nucleosomes. In their [paper](https://doi.org/10.1038/s41588-019-0538-0) they define candidate regions to be 500bp (150bp of the DHS peak extended by 175bp in each direction).
+It seems the peak width is slightly larger in this dataset (~200bp) than in the dataset used in the paper (150bp). We will therefor use a summit width of 275 (200bp peak width plus 175bp each side). 
+Subsequently, reads were counted with `DiffBind::dba.count(DBA, summits = 275, minOverlap=2)` in the 1216037 consensus peaks identified by `DiffBind`. `DiffBind` takes the number of uniquely aligned reads to compute a normalised read count for each sample at every potential binding site. The peaks in the consensus peaks are re-centred and trimmed based on calculating their summits (point of greatest read overlap) in order to provide more standardized peak intervals. We used background normalisation as recommended by the [DiffBind vignette](https://bioconductor.org/packages/release/bioc/vignettes/DiffBind/inst/doc/DiffBind.pdf).
+
+The candidate putative enhancer regions were then identified as those consensus peaks with the top 150000 activity (i.e. mean normalized read count). This approach utilises the available replicates without merging the available bam files.
+Finally we merged the candidate putative enhancer regions with the annotated TSS file region ("include-list"), as the ABC model considers promoters as part of the putative enhancer set. This forces the candidate enhancer regions to include gene promoters, even if the promoter is not among the candidate elements with the strongest signals genome-wide in a cell type.
+
+```{bash eval=FALSE, include=FALSE}
+# example for makeCandidateRegions.py
+python src/makeCandidateRegions.py \
+    --narrowPeak example_chr22/ABC_output/Peaks/wgEncodeUwDnaseK562AlnRep1.chr22.macs2_peaks.narrowPeak.sorted \
+    --bam example_chr22/input_data/Chromatin/wgEncodeUwDnaseK562AlnRep1.chr22.bam \
+    --outDir example_chr22/ABC_output/Peaks/ \
+    --chrom_sizes example_chr22/reference/chr22 \
+    --regions_blocklist reference/wgEncodeHg19ConsensusSignalArtifactRegions.bed \
+    --regions_includelist example_chr22/reference/RefSeqCurated.170308.bed.CollapsedGeneBounds.TSS500bp.chr22.bed \
+    --peakExtendFromSummit 250 \
+    --nStrongestPeaks 3000 
+
+```
+
+```{bash eval=FALSE, include=FALSE}
+# parameters for makeCandidateRegions.py
+makeCandidateRegions.py [-h] 
+    --narrowPeak NARROWPEAK narrowPeak file output by macs2. Must include summits (--call-summits) (default: None)
+    --bam BAM DNAase-Seq or ATAC-Seq bam file (default: None)
+    --chrom_sizes CHROM_SIZES 
+    --outDir OUTDIR
+    [--nStrongestPeaks NSTRONGESTPEAKS] Number of peaks to use for defining candidate regions (default: 175000)
+    [--peakExtendFromSummit PEAKEXTENDFROMSUMMIT] Number of base pairs to extend each preak from its summit (or from both ends of region if using --ignoreSummits) (default: 250)
+    [--ignoreSummits] Compute peaks using the full peak regions, rather than extending from summit. (default: False)
+    [--minPeakWidth MINPEAKWIDTH] Candidate regions whose width is below this threshold are expanded to this width. Only used with --ignoreSummits (default: 500)
+    [--regions_includelist REGIONS_INCLUDELIST] Bed file of regions to forcibly include in candidate enhancers. Overrides regions_blocklist (default: )
+    [--regions_blocklist REGIONS_BLOCKLIST] Bed file of regions to forcibly exclude from candidate enhancers (default: )
+
+```
+
+The results of the identification of the candidate regions can be found in the `ABC_results_step1` directory.
+
+
+## Quantifying enhancer activity
+
+For step 2 of the ABC model, we use `run.neighborhoods.py` for counting ATAC-seq (or DNase-seq) and H3K27ac ChIP-seq reads in candidate enhancer regions identified in step 1. Additionally, the function counts reads in gene bodies and promoter regions (`GeneList.txt`)
+
+Replicate counts in epigenetic experiments (given as comma delimited list of files) will be averaged when computing enhancer activity.
+
+The ABC model does not perform well for ubiquitously expressed genes. The ABC algorithm comes with a set of ubiquitously expressed genes in human (hg19) that they curated for their [paper](https://doi.org/10.1038/s41588-019-0538-0). As we are using the Ensembl annotation the list of ubiquitously expressed gene symbols needs to be converted to ensembl gene ids (via [BioMart](http://www.ensembl.org/biomart/martview/9e2f52d3881ee9d8cc6745d313d60f2a)). 
+
+```{r}
+# see `1-1.ABC_algorithm_TSS_annotation.Rmd` gene symbol conversion via BioMArt
+```
+
+### Gene expression in ABC
+
+The ABC model is designed to predicted the effect of enhancers on expressed genes. In the absence of expression data, ATAC-seq and H3K27ac ChIP-seq at the promoter can be used as a proxy. It was suggested to only consider enhancer-gene connections for genes with sufficiently active promoters (for instance in the top 60% of gene promoters in the cell type).
+Here we use the RNA expression as input into the `run.neighborhoods.py` step to define expressed genes.
+
+```{bash eval=FALSE, include=FALSE}
+# example for run.neighborhoods.py
+python src/run.neighborhoods.py \
+    --candidate_enhancer_regions example_chr22/ABC_output/Peaks/wgEncodeUwDnaseK562AlnRep1.chr22.macs2_peaks.narrowPeak.sorted.candidateRegions.bed \
+    --genes example_chr22/reference/RefSeqCurated.170308.bed.CollapsedGeneBounds.chr22.bed \
+    --H3K27ac example_chr22/input_data/Chromatin/ENCFF384ZZM.chr22.bam \
+    --DHS example_chr22/input_data/Chromatin/wgEncodeUwDnaseK562AlnRep1.chr22.bam,example_chr22/input_data/Chromatin/wgEncodeUwDnaseK562AlnRep2.chr22.bam \
+    --expression_table example_chr22/input_data/Expression/K562.ENCFF934YBO.TPM.txt \
+    --chrom_sizes example_chr22/reference/chr22 \
+    --ubiquitously_expressed_genes reference/UbiquitouslyExpressedGenesHG19.txt \
+    --cellType K562 \
+    --outdir example_chr22/ABC_output/Neighborhoods/ 
+
+```
+
+```{bash eval=FALSE, include=FALSE}
+# parameters for run.neighborhoods.py
+usage: run.neighborhoods.py [-h] 
+    --candidate_enhancer_regions CANDIDATE_ENHANCER_REGIONS Bed file containing candidate_enhancer_regions (default: None)
+    --outdir OUTDIR Directory to write Neighborhood files to. (default: None)
+  --genes GENES         bed file with gene annotations. Must be in bed-6 format. Will be used to assign TSS to genes. (default: None)
+  --genes_for_class_assignment GENES_FOR_CLASS_ASSIGNMENT
+                        bed gene annotations for assigning elements to promoter/genic/intergenic classes. Will not be used for TSS definition (default: None)
+  --ubiquitously_expressed_genes UBIQUITOUSLY_EXPRESSED_GENES
+                        File listing ubiquitously expressed genes. These will be flagged by the model, but this annotation does not affect model predictions (default: None)
+  --gene_name_annotations GENE_NAME_ANNOTATIONS
+                        Comma delimited string of names corresponding to the gene identifiers present in the name field of the gene annotation bed file (default: symbol)
+  --primary_gene_identifier PRIMARY_GENE_IDENTIFIER
+                        Primary identifier used to identify genes. Must be present in gene_name_annotations. The primary identifier must be unique (default: symbol)
+  --skip_gene_counts    Do not count over genes or gene bodies. Will not produce GeneList.txt. Do not use switch if intending to run Predictions (default: False)
+  --H3K27ac [H3K27AC]   Comma delimited string of H3K27ac .bam files (default: )
+  --DHS [DHS]           Comma delimited string of DHS .bam files. Either ATAC or DHS must be provided (default: )
+  --ATAC [ATAC]         Comma delimited string of ATAC .bam files. Either ATAC or DHS must be provided (default: )
+  --default_accessibility_feature [DEFAULT_ACCESSIBILITY_FEATURE]
+                        If both ATAC and DHS are provided, this flag must be set to either 'DHS' or 'ATAC' signifying which datatype to use in computing activity (default: None)
+  --expression_table [EXPRESSION_TABLE]
+                        Comma delimited string of gene expression files (default: )
+  --qnorm QNORM         Quantile normalization reference file (default: None)
+  --tss_slop_for_class_assignment TSS_SLOP_FOR_CLASS_ASSIGNMENT
+                        Consider an element a promoter if it is within this many bp of a tss (default: 500)
+  --skip_rpkm_quantile  Do not compute RPKM and quantiles in EnhancerList.txt (default: False)
+  --use_secondary_counting_method
+                        Use a slightly slower way to count bam over bed. Also requires more memory. But is more stable (default: False)
+  --chrom_sizes CHROM_SIZES
+                        Genome file listing chromosome sizes. Also requires associated .bed file (default: None)
+  --enhancer_class_override ENHANCER_CLASS_OVERRIDE
+                        Annotation file to override enhancer class assignment (default: None)
+  --supplementary_features SUPPLEMENTARY_FEATURES
+                        Additional features to count over regions (default: None)
+  --cellType CELLTYPE   Name of cell type (default: None)
+
+
+```
+
+```{r eval=FALSE, include=FALSE}
+slurm_cmd <-
+  str_c(
+    "sbatch -c 8 --mem-per-cpu 8G -N 1 --time 24:00:00 --output",
+    str_c(log_dir,
+          "1-1d.ABC_runNeighborhoods.log",
+          sep = "/"),
+    "--error",
+    str_c(log_dir,
+          "1-1d.ABC_runNeighborhoods.log",
+          sep = "/"),
+    str_c(scripts_dir, "1-1d.ABC_runNeighborhoods.sh", sep = "/"),
+    str_c(H3K27ac_bam_files, collapse = ","), 
+    str_c(ATAC_bam, collapse = ","),
+    str_c(RNA_expr_files, collapse = ","),
+    output_dirs[1],
+    sep = " "
+  )
+
+slurm_cmd
+```
+
+The results of the `run.neighborhoods.py` step can be found in the `Neigborhoods` directory.
+
+## Computing the ABC score
+
+Compute ABC scores by combining Activity (as calculate in step 2: `run.neighborhoods.py`) and Hi-C. 
+
+As cell-type specific Hi-C data is more difficult to obtain than ATAC-seq or ChIP-seq, an alternative approache was developed by the model authors. It has been shown that Hi-C contact frequencies generally follow a powerlaw relationship (with respect to genomic distance) and that many TADs, loops and other structural features of the 3D genome are not cell-type specific.:
+
+* using an average Hi-C profile gives approximately equally good performance as using a cell-type specific Hi-C profile
+    - provide an average Hi-C matrix (averaged across 10 cell linea, at 5kb resolution)
+    - cell types used for averaging:  GM12878, NHEK, HMEC, RPE1, THP1, IMR90, HUVEC, HCT116, K562, KBM7
+    - available at ftp://ftp.broadinstitute.org/outgoing/lincRNA/average_hic/average_hic.v2.191020.tar.gz
+* ABC model without experimental contact data (approach used here)
+    - the ABC model can be run using the powerlaw estimate only
+    - for this exclude the `--HiCdir` argument from `predict.py` and the `--score_column powerlaw.Score` argument should be included
+    - the `ABC.Score` column of the predictions file with be set to `NaN` and the `powerlaw.Score` column of the ouput predicition files will be the relevant Score column to use
+
+```{bash eval=FALSE, include=FALSE}
+# example for predict.py
+python src/predict.py \
+    --enhancers example_chr22/ABC_output/Neighborhoods/EnhancerList.txt \
+    --genes example_chr22/ABC_output/Neighborhoods/GeneList.txt \
+    --HiCdir example_chr22/input_data/HiC/raw/ \
+    --chrom_sizes example_chr22/reference/chr22 \
+    --hic_resolution 5000 \
+    --scale_hic_using_powerlaw \
+    --threshold .02 \
+    --cellType K562 \
+    --outdir example_chr22/ABC_output/Predictions/ \
+    --make_all_putative
+```
+
+```{bash eval=FALSE, include=FALSE}
+# parameters for predict.py
+usage: predict.py [-h]
+--enhancers ENHANCERS
+                        Candidate enhancer regions. Formatted as the EnhancerList.txt file produced by run.neighborhoods.py (default: None)
+  --genes GENES         Genes to make predictions for. Formatted as the GeneList.txt file produced by run.neighborhoods.py (default: None)
+  --outdir OUTDIR       output directory (default: None)
+  --window WINDOW       Make predictions for all candidate elements within this distance of the gene`s TSS (default: 5000000)
+  --score_column SCORE_COLUMN
+                        Column name of score to use for thresholding (default: ABC.Score)
+  --threshold THRESHOLD
+                        Threshold on ABC Score (--score_column) to call a predicted positive (default: 0.022)
+  --cellType CELLTYPE   Name of cell type (default: None)
+  --chrom_sizes CHROM_SIZES
+                        Chromosome sizes file (default: None)
+  --HiCdir HICDIR       HiC directory (default: None)
+  --hic_resolution HIC_RESOLUTION
+                        HiC resolution (default: None)
+  --tss_hic_contribution TSS_HIC_CONTRIBUTION
+                        Weighting of diagonal bin of hic matrix as a percentage of the maximum of its neighboring bins (default: 100)
+  --hic_pseudocount_distance HIC_PSEUDOCOUNT_DISTANCE
+                        A pseudocount is added equal to the powerlaw fit at this distance (default: 1000000.0)
+  --hic_type {juicebox,bedpe}
+                        format of hic files (default: juicebox)
+  --hic_is_doubly_stochastic
+                        If hic matrix is already DS, can skip this step (default: False)
+  --scale_hic_using_powerlaw
+                        Scale Hi-C values using powerlaw relationship (default: False)
+  --hic_gamma HIC_GAMMA
+                        powerlaw exponent of hic data. Must be positive (default: 0.87)
+  --hic_gamma_reference HIC_GAMMA_REFERENCE
+                        powerlaw exponent to scale to. Must be positive (default: 0.87)
+  --run_all_genes       Do not check for gene expression, make predictions for all genes (default: False)
+  --expression_cutoff EXPRESSION_CUTOFF
+                        Make predictions for genes with expression higher than this value (default: 1)
+  --promoter_activity_quantile_cutoff PROMOTER_ACTIVITY_QUANTILE_CUTOFF
+                        Quantile cutoff on promoter activity. Used to consider a gene 'expressed' in the absence of expression data (default: 0.4)
+  --make_all_putative   Make big file with concatenation of all genes file (default: False)
+  --use_hdf5            Write AllPutative file in hdf5 format instead of tab-delimited (default: False)
+  --tss_slop TSS_SLOP   Distance from tss to search for self-promoters (default: 500)
+  --chromosomes CHROMOSOMES
+                        chromosomes to make predictions for. Defaults to intersection of all chromosomes in --genes and --enhancers (default: all)
+  --include_chrY, -y    Make predictions on Y chromosome (default: False)
+
+```
+
+```{r eval=FALSE, include=FALSE}
+slurm_cmd <-
+  str_c(
+    "sbatch -c 8 --mem-per-cpu 8G -N 1 --time 24:00:00 --output",
+    str_c(log_dir,
+          "1-1e.ABC_predict.log",
+          sep = "/"),
+    "--error",
+    str_c(log_dir,
+          "1-1e.ABC_predict.log",
+          sep = "/"),
+    str_c(scripts_dir, "1-1e.ABC_predict.sh", sep = "/"),
+    output_dirs[1],
+    sep = " "
+  )
+
+slurm_cmd
+```
+
+`predict.py` also includes filtering strategies as described in [Nasser et al](https://pubmed.ncbi.nlm.nih.gov/33828297/).
+
+The output files of the `predict.py` can be found in the `ABC_results_step2_and_step3` directory.
+
+## Further considerations on the ABC algorithm
+
+### Quantile normalisation
+
+In an effort to make ABC scores comparable across cell types, the ABC model support quantile normalizing the epigenetic signal in candidate enhancer regions to some reference. 
+Quantile normalisation can be applied using `--qnorm` in `run.neigborhoods.py`.
+
+### Additional notes
+
+* Accurate TSS annotations are critical as the TSS are used to assign enhancer-promoter contact frequency. If the TSS annotation is inaccurate (off by >5kb) it will lead to inaccurate predictions.
+
+* ubiquitously expressed genes appear insensitive to the effects of distal enhancers. For completeness, the ABC algorithm calculates the ABC score for all genes and flags ubiquitously expressed genes.
+
+* the size of candidate enhancer elements is important; if two candidate regions are merged, then the ABC score of the merged region will be approximately the sum of the ABC scores for each individual region
+
+* typically the ABC model predicts on average ~3 distal enhancers per expressed gene. If large deviations are detected (<2 or >5) this may mean the ABC model is not well calibrated in the cell type. Typical remedies are to use quantile normalisation, scale Hi-C or to lower/raise the cutoff on the ABC score.
+
+
+# Results: Survey of Enhancer predictions
+
+Below we survey those element-gene pairs with scores above the provided threshold. Below, we investigate only expressed genes and do not include promoter elements. We survey "positive predictions of the ABC model", i.e. those enhancer-gene connections above a threshold of 0.022 which corresponds to approximately 70% recall and 60% precision according to the [paper](https://pubmed.ncbi.nlm.nih.gov/31784727/).
+
+```{r message=FALSE}
+enhancer_predict <-
+  read_tsv(
+    here(
+      "data",
+      "derived_data",
+      "Tables",
+      "1-3.ABC_algorithm",
+      "EnhancerPredictions.txt"
+    )
+  ) %>% 
+  select(-CellType) %>% 
+  left_join(gene_to_symbol, by = c("TargetGene" = "gene_id"))
+```
+
+In total, we detected `r NROW(enhancer_predict)` enhancer-gene connections. This is ~ half the median number of enhancer-gene connection (48441) described in [Nasser et al](https://pubmed.ncbi.nlm.nih.gov/33828297/). Nonetheless, the total number of detected ABC enhancers (`r NROW(unique(enhancer_predict$name))`) is close to the median number of ABC enhancers (17605) detected in [other cell types](https://pubmed.ncbi.nlm.nih.gov/33828297/).
+
+On average each expressed gene is regulated by `r enhancer_predict %>% group_by(TargetGene) %>% summarise(nb_enhancers = n()) %>% {mean(.$nb_enhancers)} %>% round(digits = 2)`. This is within the expected range though tends towards the lower bound estimate. Genes may be regulated by up to `r enhancer_predict %>% group_by(TargetGene) %>% summarise(nb_enhancers = n()) %>% {max(.$nb_enhancers)}` ABC enhancers (This is similar to the up to 14 elements reported previously). 
+
+In turn, each enhancer is predicted to regulate `r enhancer_predict %>% group_by(name) %>% summarise(nb_genes = n()) %>% {mean(.$nb_genes)} %>% round(digits = 2)` genes, on average. 
+
+```{r}
+within_100k <- enhancer_predict %>%
+  dplyr::rename(seqnames = chr) %>%
+  as_granges() %>%
+  anchor_centre() %>%
+  mutate(width = 1) %>%
+  as_tibble() %>%
+  mutate(dist_to_TSS = abs(TargetGeneTSS - start)) %>% 
+  filter(dist_to_TSS < 100000)
+```
+
+The majority of detected ABC enhancers (`r round(NROW(within_100k)/NROW(enhancer_predict) * 100, digits = 2)`%) are located within 100kb of their target promoter, which is in line with the previously reported distances.
+
+The enhancer prediction are downloadable at the following link:
+
+```{r}
+enhancer_predict %>%
+  downloadthis::download_this(
+    output_name = "ABC enhancer predictions",
+    output_extension = ".csv",
+    button_label = "ABC enhancer predictions as csv",
+    button_type = "default",
+    has_icon = TRUE,
+    icon = "fa fa-save"
+  )
+```
+
+
+```{r}
+write_tsv(
+  enhancer_predict,
+  str_c(
+    output_dirs[["Tables"]],
+    "EnhancerPredictions_with_gene_symbols.txt",
+    sep = "/"
+  )
+)
+```
+
+```{r message=FALSE, warning=FALSE}
+read_tsv(
+  here(
+    "data",
+    "derived_data",
+    "Tables",
+    "1-3.ABC_algorithm",
+    "GenePredictionStats.txt"
+  )
+) %>%
+  left_join(gene_to_symbol, by = c("TargetGene" = "gene_id")) %>% 
+write_tsv(
+  enhancer_predict,
+  str_c(
+    output_dirs[["Tables"]],
+    "GenePredictionStats_with_gene_symbols.txt",
+    sep = "/"
+  )
+)
+```
